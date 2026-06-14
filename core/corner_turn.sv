@@ -50,6 +50,11 @@ module corner_turn (
     logic [7:0] spatial_oy;        // 当前输出行 (0..out_h-1)
     logic [7:0] spatial_oxg;       // 当前行内 64b word 偏移 (0..out_row_stride-1)
 
+    // 【新增】追踪当前的 OCG 以及计算真实的物理高度
+    logic [4:0] ct_ocg;            // 当前正在写入的 OCG 组 (每组 4 通道)
+    logic [7:0] actual_out_h;      // 真实物理高度
+    assign actual_out_h = cfg.pool_bypass ? cfg.out_h : (cfg.out_h >> 1);
+
     // ═══════════════════════════════════════════════════════════════
     // Time Gearbox (ct_mode=CT_GEARBOX): 32b→64b 拼装
     //   half_full=0: 暂存 pp_data → gearbox_reg[31:0]
@@ -78,6 +83,7 @@ module corner_turn (
                 sram_write_cnt <= 0;
                 spatial_oy  <= 0;
                 spatial_oxg <= 0;
+                ct_ocg      <= 0;
             end
 
             if (cfg.ct_mode) begin
@@ -87,10 +93,15 @@ module corner_turn (
                         gearbox_reg <= pp_data;
                         half_full <= 1;
                     end else begin
-                        im_wr_en   <= 1;
-                        im_wr_data <= {pp_data, gearbox_reg};
-                        im_wr_addr <= cfg.im_write_base + sram_write_cnt[8:0];
-                        sram_write_cnt <= sram_write_cnt + 1;
+                        // 【核心修复1】：防止 64 通道物理边界产生的垃圾数据越界覆盖
+                        // 只有当写入计数未达到 im_total_writes 时才使能写信号
+                        if (sram_write_cnt < cfg.im_total_writes) begin
+                            im_wr_en   <= 1;
+                            im_wr_data <= {pp_data, gearbox_reg};
+                            im_wr_addr <= cfg.im_write_base + sram_write_cnt[8:0];
+                            sram_write_cnt <= sram_write_cnt + 1;
+                        end
+                        // 无论是否写入，状态机都要清空，安全吸收垃圾数据
                         half_full <= 0;
                     end
                 end
@@ -100,32 +111,43 @@ module corner_turn (
 
                 // Scatter-write: 每拍输出一个 ch_group 的 8 spatial 值(64b)
                 if (scatter_active) begin
-                    im_wr_en <= 1;
-                    im_wr_data <= {matrix_buf[scatter_bank][scatter_ch][7],
-                                   matrix_buf[scatter_bank][scatter_ch][6],
-                                   matrix_buf[scatter_bank][scatter_ch][5],
-                                   matrix_buf[scatter_bank][scatter_ch][4],
-                                   matrix_buf[scatter_bank][scatter_ch][3],
-                                   matrix_buf[scatter_bank][scatter_ch][2],
-                                   matrix_buf[scatter_bank][scatter_ch][1],
-                                   matrix_buf[scatter_bank][scatter_ch][0]};
-                    // IM addr = base + ch×ch_stride + oy×row_stride + oxg
-                    im_wr_addr <= cfg.im_write_base
-                                + scatter_ch * cfg.out_ch_stride
-                                + spatial_oy * cfg.out_row_stride
-                                + spatial_oxg;
-                    sram_write_cnt <= sram_write_cnt + 1;
+                    // 【核心修复2】：防止 out_ch 未对齐 8 时，尾部的垃圾通道越界覆盖
+                    // 当前通道绝对索引: ct_ocg * 4 + scatter_ch (因为 matrix_buf 是 4 通道宽)
+                    if ((ct_ocg * 4 + {2'b0, scatter_ch}) < cfg.out_ch) begin
+                        im_wr_en <= 1;
+                        im_wr_data <= {matrix_buf[scatter_bank][scatter_ch][7],
+                                       matrix_buf[scatter_bank][scatter_ch][6],
+                                       matrix_buf[scatter_bank][scatter_ch][5],
+                                       matrix_buf[scatter_bank][scatter_ch][4],
+                                       matrix_buf[scatter_bank][scatter_ch][3],
+                                       matrix_buf[scatter_bank][scatter_ch][2],
+                                       matrix_buf[scatter_bank][scatter_ch][1],
+                                       matrix_buf[scatter_bank][scatter_ch][0]};
+                        
+                        // IM addr = base + ch×ch_stride + oy×row_stride + oxg
+                        im_wr_addr <= cfg.im_write_base
+                                    + (ct_ocg * 4 + {2'b0, scatter_ch}) * cfg.out_ch_stride
+                                    + spatial_oy * cfg.out_row_stride
+                                    + spatial_oxg;
+                                    
+                        // 只有发生真实写入时，才增加全局计数器
+                        sram_write_cnt <= sram_write_cnt + 1;
+                    end
 
                     if (scatter_ch == 2'd3) begin
                         // Scatter 4 拍完成 → 推进 spatial 坐标
                         scatter_active <= 0;
                         scatter_ch <= 0;
+                        
                         if (spatial_oxg == cfg.out_row_stride - 8'd1) begin
                             spatial_oxg <= 0;
-                            if (spatial_oy == cfg.out_h - 8'd1)
+                            // 使用 actual_out_h 来判断是否走完了一张完整的特征图
+                            if (spatial_oy == actual_out_h - 8'd1) begin
                                 spatial_oy <= 0;
-                            else
+                                ct_ocg <= ct_ocg + 1;  // 走完一整张图，OCG 加 1，切入下 4 个通道！
+                            end else begin
                                 spatial_oy <= spatial_oy + 8'd1;
+                            end
                         end else begin
                             spatial_oxg <= spatial_oxg + 8'd1;
                         end

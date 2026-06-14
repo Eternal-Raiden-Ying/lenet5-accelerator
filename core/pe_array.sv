@@ -43,20 +43,21 @@ module pe_array (
     logic [3:0] kx_d1;
     logic [6:0] mux_shift_d1;
     logic [7:0] pp_valid_d1;
-    logic       mode_d1;
-
-    // ── mux_shift 组合计算 (原 im_agu 逻辑, 现移至 pe_array 内部) ──
-    logic signed [9:0] base_x;
+    // ── mux_shift 组合计算 (重构移位逻辑) ──
+    logic signed [9:0] cur_base_x;
     logic [6:0] mux_shift_comb;
-    assign base_x = $signed({1'b0, cnt_ox}) * $signed({6'b0, cfg.stride_w})
-                  - $signed({6'b0, cfg.pad_w});
-    assign mux_shift_comb = {4'd0, (base_x[2:0] + cnt_kx[2:0]) & 3'd7} * 7'd8;
+    
+    // 把 kx 加进基址计算中，获取当前需要截取的真实起始坐标
+    assign cur_base_x = $signed({1'b0, cnt_ox}) * $signed({6'b0, cfg.stride_w})
+                      - $signed({6'b0, cfg.pad_w}) + $signed({6'b0, cnt_kx});
 
+    // 因为窗口已经随 kx 移动，偏移量严格约束在 0-7 个像素以内 (0-56 bit)
+    assign mux_shift_comb = {4'd0, cur_base_x[2:0]} * 7'd8;
+    
     always_ff @(posedge clk) begin
         kx_d1        <= cnt_kx;
         mux_shift_d1 <= mux_shift_comb;
         pp_valid_d1  <= pp_valid;
-        mode_d1      <= cfg.mode;
     end
 
     // ═══════════════════════════════════════════════════════════════
@@ -93,12 +94,10 @@ module pe_array (
     logic  [7:0] wt_8x8 [0:7];
     logic [511:0] wt_data_full;       // MODE_1x64: 全 64 weight
     logic  [7:0] pp_valid_reg;
-    logic        mode_reg;
 
     always_ff @(posedge clk) begin
         pp_data      <= pp_data_comb;
         pp_valid_reg <= pp_valid_d1;
-        mode_reg     <= mode_d1;
         wt_data_full <= wt_rd_data;           // MODE_1x64: 全量寄存
         for (int i = 0; i < 8; i++)
             wt_8x8[i] <= wt_sel_comb[i];      // MODE_8x8: 选组后寄存
@@ -124,7 +123,7 @@ module pe_array (
                 for (int p_oc = 0; p_oc < 8; p_oc = p_oc + 1)
                     acc[p_ox][p_oc] <= 0;
         end else if (mac_en_sync) begin
-            if (mode_reg == MODE_8x8) begin
+            if (cfg.mode == MODE_8x8) begin
                 for (int p_ox = 0; p_ox < 8; p_ox = p_ox + 1) begin
                     if (pp_valid_reg[p_ox]) begin
                         for (int p_oc = 0; p_oc < 8; p_oc = p_oc + 1) begin
@@ -136,6 +135,10 @@ module pe_array (
                                 ? prod
                                 : acc[p_ox][p_oc] + prod;
                         end
+                    end else if (clear_accum_sync && !cfg.keep_accum) begin
+                        // pp_valid=0 时跳过 MAC，但仍需清零（跨 ox step 清残留）
+                        for (int p_oc = 0; p_oc < 8; p_oc = p_oc + 1)
+                            acc[p_ox][p_oc] <= 0;
                     end
                 end
             end else begin  // MODE_1x64

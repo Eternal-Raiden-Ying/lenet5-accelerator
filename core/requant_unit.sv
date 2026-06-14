@@ -63,7 +63,11 @@ module requant_unit (
             ch_group_max <= 4'd1;
         end else if (layer_start) begin
             fg_ch_group  <= 0;
-            ch_group_max <= cfg.mode ? ((cfg.out_ch + 9'd3) >> 2) - 4'd1 : 4'd1;
+            // temporarily for simplifying logic, needs to consider cfg.mode, cfg.out_ch and cnt.ocg
+            // while it should use ch group max to filter those uneffective channel, it could not be done,
+            // because fifo's output is (W,C), which means uneffective channel scatter in the total output
+            // thus, we locked the ch group max to 16, equals to a counter, it doesn't influence the logic at all
+            ch_group_max <= 4'hf; 
         end else if (req_trig) begin
             fg_ch_group <= (fg_ch_group == ch_group_max) ? 4'd0
                                                         : fg_ch_group + 4'd1;
@@ -74,18 +78,24 @@ module requant_unit (
     assign rq_rd_addr = cfg.mode ? fg_ch_group
                              : {prev_rq_ocg[2:0], fg_ch_group[0]};
 
-    // Stage 1: MUL
+    // Stage 1: MUL — explicit per-channel (xsim generate bug workaround)
     logic [127:0] s1_data; logic s1_valid;
     logic [287:0] s1_rq;
-    logic signed [31:0] s1_y [0:3];
-    logic signed [31:0] s1_M  [0:3];
-    logic signed [63:0] s1_prod [0:3];
-    genvar gi;
-    generate for (gi = 0; gi < 4; gi = gi + 1) begin : gs1
-        assign s1_y[gi]    = s1_data[gi*32 +: 32];
-        assign s1_M[gi]    = s1_rq[gi*72 +: 32];
-        assign s1_prod[gi] = s1_y[gi] * s1_M[gi];
-    end endgenerate
+    logic signed [63:0] s1_prod0, s1_prod1, s1_prod2, s1_prod3;
+    logic signed [31:0] s1_y0, s1_y1, s1_y2, s1_y3;
+    logic signed [31:0] s1_M0, s1_M1, s1_M2, s1_M3;
+    assign s1_y0 = s1_data[31:0];
+    assign s1_y1 = s1_data[63:32];
+    assign s1_y2 = s1_data[95:64];
+    assign s1_y3 = s1_data[127:96];
+    assign s1_M0 = s1_rq[31:0];
+    assign s1_M1 = s1_rq[103:72];
+    assign s1_M2 = s1_rq[175:144];
+    assign s1_M3 = s1_rq[247:216];
+    assign s1_prod0 = s1_y0 * s1_M0;
+    assign s1_prod1 = s1_y1 * s1_M1;
+    assign s1_prod2 = s1_y2 * s1_M2;
+    assign s1_prod3 = s1_y3 * s1_M3;
 
     always_ff @(posedge clk) begin
         s1_data  <= fg_data;
@@ -93,33 +103,44 @@ module requant_unit (
         s1_rq    <= rq_rd_data;
     end
 
-    // Stage 2: ROUND + SHR + ADD b_fused
+    // Stage 2: ROUND + SHR + ADD b_fused — explicit per-channel
     logic [127:0] s2_y; logic s2_valid; logic [7:0] s2_zp;
-    logic  [7:0] s1_shift [0:3];
-    logic signed [31:0] s1_b [0:3];
-    logic signed [63:0] s1_rounded [0:3];
-    logic signed [31:0] s2_part [0:3];
-    generate for (gi = 0; gi < 4; gi = gi + 1) begin : gs2
-        assign s1_shift[gi] = s1_rq[gi*72 + 32 +: 8];
-        assign s1_b[gi]     = s1_rq[gi*72 + 40 +: 32];
-        assign s1_rounded[gi] = (s1_shift[gi] > 0)
-            ? s1_prod[gi] + (64'sd1 << (s1_shift[gi] - 1))
-            : s1_prod[gi];
-        assign s2_part[gi] = s1_rounded[gi] >>> s1_shift[gi] + s1_b[gi];
-    end endgenerate
+    logic  [7:0] s1_shift0, s1_shift1, s1_shift2, s1_shift3;
+    logic signed [31:0] s1_b0, s1_b1, s1_b2, s1_b3;
+    logic signed [63:0] s1_rounded0, s1_rounded1, s1_rounded2, s1_rounded3;
+    logic signed [31:0] s2_part0, s2_part1, s2_part2, s2_part3;
+    assign s1_shift0 = s1_rq[39:32];
+    assign s1_shift1 = s1_rq[111:104];
+    assign s1_shift2 = s1_rq[183:176];
+    assign s1_shift3 = s1_rq[255:248];
+    assign s1_b0     = s1_rq[71:40];
+    assign s1_b1     = s1_rq[143:112];
+    assign s1_b2     = s1_rq[215:184];
+    assign s1_b3     = s1_rq[287:256];
+    assign s1_rounded0 = (s1_shift0 > 0) ? s1_prod0 + (64'sd1 << (s1_shift0 - 1)) : s1_prod0;
+    assign s1_rounded1 = (s1_shift1 > 0) ? s1_prod1 + (64'sd1 << (s1_shift1 - 1)) : s1_prod1;
+    assign s1_rounded2 = (s1_shift2 > 0) ? s1_prod2 + (64'sd1 << (s1_shift2 - 1)) : s1_prod2;
+    assign s1_rounded3 = (s1_shift3 > 0) ? s1_prod3 + (64'sd1 << (s1_shift3 - 1)) : s1_prod3;
+    assign s2_part0 = (s1_rounded0 >>> s1_shift0) + s1_b0;
+    assign s2_part1 = (s1_rounded1 >>> s1_shift1) + s1_b1;
+    assign s2_part2 = (s1_rounded2 >>> s1_shift2) + s1_b2;
+    assign s2_part3 = (s1_rounded3 >>> s1_shift3) + s1_b3;
 
     always_ff @(posedge clk) begin
-        for (int i = 0; i < 4; i++) s2_y[i*32 +: 32] <= s2_part[i];
+        s2_y[31:0]   <= s2_part0;
+        s2_y[63:32]  <= s2_part1;
+        s2_y[95:64]  <= s2_part2;
+        s2_y[127:96] <= s2_part3;
         s2_valid <= s1_valid; s2_zp <= cfg.zp_y;
     end
 
     // Stage 3: ADD zp_y + CLAMP
     always_ff @(posedge clk) begin
         if (s2_valid) begin
-            rq_data[7:0]   <= clamp8(s2_y[31:0]   + s2_zp);
-            rq_data[15:8]  <= clamp8(s2_y[63:32]  + s2_zp);
-            rq_data[23:16] <= clamp8(s2_y[95:64]  + s2_zp);
-            rq_data[31:24] <= clamp8(s2_y[127:96] + s2_zp);
+            rq_data <= {clamp8(s2_y[127:96] + s2_zp),
+                        clamp8(s2_y[95:64]  + s2_zp),
+                        clamp8(s2_y[63:32]  + s2_zp),
+                        clamp8(s2_y[31:0]   + s2_zp)};
             rq_valid <= 1;
         end else rq_valid <= 0;
     end

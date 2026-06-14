@@ -155,6 +155,10 @@ module compute_fsm (
         end else begin
             layer_done <= 0; flush_strobe <= 0;
             clear_accum <= 0; layer_start <= 0;
+            // 更新前拍计数器 (变化检测)
+            cnt_prev.ic  <= cnt_cur.ic;  cnt_prev.ox  <= cnt_cur.ox;
+            cnt_prev.oy  <= cnt_cur.oy;  cnt_prev.ky  <= cnt_cur.ky;
+            cnt_prev.kx  <= cnt_cur.kx;  cnt_prev.ocg <= cnt_cur.ocg;
 
             case (state)
                 CORE_F_IDLE: begin
@@ -175,6 +179,7 @@ module compute_fsm (
                     if (check_fail) begin
                         core_error <= 2'b10;    // FSM 参数异常
                         core_busy  <= 0;
+                        mac_en <= 0;
                     end else begin
                         layer_start <= 1;       // 脉冲: 通知 im_agu 初始化 DDA 状态
                         core_error <= 2'b00;
@@ -184,47 +189,44 @@ module compute_fsm (
                         core_busy <= 1;
                         // keep_accum=0 时清零 PE 累加器; =1 时保留 (FC 跨 chunk)
                         if (!L.keep_accum) clear_accum <= 1;
+                        mac_en <= 1;
                     end
                 end
 
                 CORE_F_COMPUTE: begin
-                    mac_en <= 1;
                     // im_rd_req / wt_rd_req: 组合 assign (见末尾), 不在 always_ff 中赋值
 
                     // ── 统一 6 层嵌套 (ocg→oy→ox→ic→ky→kx), 双模共用 ──
                     //   MODE_8x8: L.kernel_w/L.kernel_h 为卷积核尺寸, L_ow/L_oh 为输出尺寸
                     //   MODE_1x64: L.kernel_w=in_w, L.kernel_h=in_h, L_ow=L_oh=1 (自然退化)
-                    if (kx_last) begin
-                        cnt_cur.kx <= 0;
-                        if (ky_last) begin
-                            cnt_cur.ky <= 0;
-                            if (ic_last) begin
-                                cnt_cur.ic <= 0;
-                                if (!L.disable_flush) begin
-                                    flush_strobe <= 1;
-                                    clear_accum <= 1;
-                                end
-                                if (ox_last) begin
-                                    cnt_cur.ox <= 0;
-                                    if (oy_last) begin
-                                        cnt_cur.oy <= 0;
-                                        if (ocg_last) begin
-                                            cnt_cur.ocg <= 0;
-                                        end else cnt_cur.ocg <= cnt_cur.ocg + 1;
-                                    end else cnt_cur.oy <= cnt_cur.oy + 1;
-                                end else cnt_cur.ox <= (L.mode == MODE_8x8) ? cnt_cur.ox + 8'd8 : cnt_cur.ox + 8'd1;  // PE spatial parallelism = 8
-                            end else cnt_cur.ic <= cnt_cur.ic + 1;
-                        end else cnt_cur.ky <= cnt_cur.ky + 1;
-                    end else cnt_cur.kx <= cnt_cur.kx + 1;
-
-                    // 更新前拍计数器 (变化检测)
-                    cnt_prev.ic  <= cnt_cur.ic;  cnt_prev.ox  <= cnt_cur.ox;
-                    cnt_prev.oy  <= cnt_cur.oy;  cnt_prev.ky  <= cnt_cur.ky;
-                    cnt_prev.kx  <= cnt_cur.kx;  cnt_prev.ocg <= cnt_cur.ocg;
+                    if (mac_en) begin
+                        if (kx_last) begin
+                            cnt_cur.kx <= 0;
+                            if (ky_last) begin
+                                cnt_cur.ky <= 0;
+                                if (ic_last) begin
+                                    cnt_cur.ic <= 0;
+                                    if (!L.disable_flush) begin
+                                        flush_strobe <= 1;
+                                        clear_accum <= 1;
+                                    end
+                                    if (ox_last) begin
+                                        cnt_cur.ox <= 0;
+                                        if (oy_last) begin
+                                            cnt_cur.oy <= 0;
+                                            if (ocg_last) begin
+                                                cnt_cur.ocg <= 0;
+                                                mac_en <= 0;
+                                            end else cnt_cur.ocg <= cnt_cur.ocg + 1;
+                                        end else cnt_cur.oy <= cnt_cur.oy + 1;
+                                    end else cnt_cur.ox <= (L.mode == MODE_8x8) ? cnt_cur.ox + 8'd8 : cnt_cur.ox + 8'd1;  // PE spatial parallelism = 8
+                                end else cnt_cur.ic <= cnt_cur.ic + 1;
+                            end else cnt_cur.ky <= cnt_cur.ky + 1;
+                        end else cnt_cur.kx <= cnt_cur.kx + 1;
+                    end
                 end
 
                 CORE_F_DONE: begin
-                    mac_en <= 0;
                     if (fifo_empty && (sram_write_cnt >= L.im_total_writes)) begin
                         layer_done <= 1;
                         core_busy <= 0;
@@ -232,7 +234,6 @@ module compute_fsm (
                 end
 
                 CORE_F_ERROR: begin
-                    mac_en <= 0; core_busy <= 0;
                     if (cfg_valid && !check_fail) begin
                         // 合法配置到来: 清除 error, 回到 CHECK
                         core_error <= 2'b00;
@@ -248,7 +249,7 @@ module compute_fsm (
     // ═══════════════════════════════════════════════════════════════
     // im_rd_req / wt_rd_req: 组合逻辑
     // ═══════════════════════════════════════════════════════════════
-    assign im_rd_req = mac_en && (cnt.kx == 0);
+    assign im_rd_req = mac_en;
     assign wt_rd_req = ((L.mode == MODE_1x64) ? 1'b1 : (cnt.kx == 0)) && mac_en;
 
 endmodule

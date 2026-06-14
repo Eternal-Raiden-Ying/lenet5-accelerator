@@ -231,7 +231,7 @@ module dma_scheduler (
                             phase          <= PH_WEIGHT;
                         end
                         PH_WEIGHT: if (dma_rsp.done) begin
-                            gearbox_rst    <= 1'b1;
+                            // gearbox_rst    <= 1'b1;
                             rq_gb.bank_sel <= 1'b0;
                             dma_req.valid  <= 1'b1;
                             dma_req.addr   <= saved_requant_ptr;
@@ -312,7 +312,7 @@ module dma_scheduler (
                             phase          <= PH_REQUANT;
                         end
                         PH_REQUANT: if (dma_rsp.done) begin
-                            gearbox_rst    <= 1'b1;
+                            // gearbox_rst    <= 1'b1;
                             rq_gb.bank_sel <= ~bank_toggle;
                             dma_req.valid  <= 1'b1;
                             dma_req.addr   <= saved_requant_ptr;

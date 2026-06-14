@@ -55,7 +55,7 @@ module bus_wrapper (
     input  wire        core_busy,
     input  wire        layer_done,
     input  wire  [1:0] core_error,
-    input  core_fsm_state_t core_fsm_state,  // Core FSM 状态 (→ APB debug)
+    input  wire core_fsm_state_t core_fsm_state,  // Core FSM 状态 (→ APB debug)
     input  wire        wt_rd_req,
     input  wire  [7:0] wt_rd_addr,
     output wire [511:0] wt_rd_data,
@@ -117,11 +117,20 @@ module bus_wrapper (
     // bank_toggle register
     // ═══════════════════════════════════════════════════════════════
     logic bank_toggle;
+    logic bank_toggle_d; // 增加一个打拍寄存器，用于检测稳定态
+
+    always_ff @(posedge HCLK or negedge HRESETn) begin
+        if (!HRESETn)
+            bank_toggle_d <= 1'b0;
+        else
+            bank_toggle_d <= bank_toggle;
+    end
 
     always_ff @(posedge HCLK or negedge HRESETn) begin
         if (!HRESETn)
             bank_toggle <= 1'b0;
-        else if (compute_done && dma_ready)
+        // 核心修复：只在 bank_toggle 稳定的周期才允许翻转
+        else if (compute_done && dma_ready && (bank_toggle == bank_toggle_d))
             bank_toggle <= ~bank_toggle;
     end
 

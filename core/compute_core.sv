@@ -122,8 +122,28 @@ module compute_core (
     // im_sram: internal read port
     // ═══════════════════════════════════════════════════════════════
     logic        im_rd_req;
-    logic  [8:0] im_rd_addr_lo, im_rd_addr_hi;
     logic [63:0] im_rd_data_lo, im_rd_data_hi;
+
+    // IM_AGU 输出的 9-bit 地址
+    logic [8:0] im_rd_addr_lo;
+    logic [8:0] im_rd_addr_hi;
+    logic       im_rd_addr_lo_vld, im_rd_addr_hi_vld;
+
+
+    // ── 打拍对齐 SRAM 延迟 ──
+    logic im_rd_addr_lo_vld_d1, im_rd_addr_hi_vld_d1;
+    always_ff @(posedge core_clk) begin
+        im_rd_addr_lo_vld_d1 <= im_rd_addr_lo_vld;
+        im_rd_addr_hi_vld_d1 <= im_rd_addr_hi_vld;
+    end
+
+    // ── 数据清洗 ──
+    // 如果是负地址，直接掐断垃圾数据塞 0 给 PE 阵列
+    logic [63:0] safe_im_rd_data_lo;
+    logic [63:0] safe_im_rd_data_hi;
+    
+    assign safe_im_rd_data_lo = im_rd_addr_lo_vld_d1 ? im_rd_data_lo : 64'd0;
+    assign safe_im_rd_data_hi = im_rd_addr_hi_vld_d1 ? im_rd_data_hi : 64'd0;
 
     // ═══════════════════════════════════════════════════════════════
     // Sub-module instances
@@ -150,6 +170,7 @@ module compute_core (
         .cfg(cfg_latched),
         .cnt(cnt),
         .im_rd_addr_lo(im_rd_addr_lo), .im_rd_addr_hi(im_rd_addr_hi),
+        .im_rd_addr_lo_vld(im_rd_addr_lo_vld), .im_rd_addr_hi_vld(im_rd_addr_hi_vld),
         .pp_valid(pp_valid)
     );
 
@@ -164,7 +185,7 @@ module compute_core (
         .cfg(cfg_latched),
         .cnt_kx(cnt.kx),
         .cnt_ox(cnt.ox),
-        .im_rd_data_lo(im_rd_data_lo), .im_rd_data_hi(im_rd_data_hi),
+        .im_rd_data_lo(safe_im_rd_data_lo), .im_rd_data_hi(safe_im_rd_data_hi),
         .pp_valid(pp_valid),
         .wt_rd_data(wt_rd_data),
         .mac_en_sync(mac_en_d2), .clear_accum_sync(clear_accum_d2),
@@ -192,6 +213,7 @@ module compute_core (
 
     pingpong_pool #(.MAX_W(32)) u_pp (
         .clk(core_clk), .rst_n(core_rst_n),
+        .layer_start(layer_start),
         .cfg(cfg_latched),
         .rq_data(rq_data), .rq_valid(rq_valid),
         .pp_data(pp_pool_data), .pp_valid(pp_pool_valid)
